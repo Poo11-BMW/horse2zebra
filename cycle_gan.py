@@ -44,8 +44,29 @@ Level-3 research upgrades (this pass):
                       on the cycle-reconstructed image vs the original.
                       Augments pixel-space cycle consistency with semantic
                       consistency at three VGG depths simultaneously.
+
+Level-4 evaluation metrics (this pass):
+  J. [FID]   Fréchet Inception Distance (Heusel et al., 2017).
+             Compares the Gaussian fitted to Inception-v3 avg-pool features
+             of real zebras vs generated zebras.  The gold-standard GAN metric.
+             Implemented without scipy — matrix square root via eigendecomposition
+             of the symmetrised product Σ_r^{½} Σ_g Σ_r^{½}.
+  K. [KID]   Kernel Inception Distance (Bińkowski et al., 2018).
+             Unbiased MMD² with polynomial kernel degree-3.  Reliable even on
+             the small horse2zebra test set (~120 images); returns mean ± std
+             across 100 random subsets.
+  L. [IS]    Inception Score (Salimans et al., 2016).
+             Measures diversity + quality of generated zebras via
+             exp(E_x[KL(p(y|x) ∥ p(y))]) from Inception-v3 softmax logits.
+  M. [LPIPS] Perceptual similarity proxy (Zhang et al., 2018).
+             VGG-based L1 feature distance between real horses and their
+             cycle-reconstructed versions F(G(x)).  Measures cycle fidelity
+             in perceptual space rather than pixel space.
+
+  All results are printed as a formatted table and saved to output/metrics.json.
 """
 
+import json
 import os
 import time
 import numpy as np
@@ -132,9 +153,9 @@ class InstanceNormalization(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         C = input_shape[-1]
-        self.scale  = self.add_weight('scale',  shape=(C,),
+        self.scale  = self.add_weight(name='scale',  shape=(C,),
                                       initializer='ones',  trainable=True)
-        self.offset = self.add_weight('offset', shape=(C,),
+        self.offset = self.add_weight(name='offset', shape=(C,),
                                       initializer='zeros', trainable=True)
 
     def call(self, x):
@@ -155,7 +176,7 @@ class SelfAttention(tf.keras.layers.Layer):
         self.k        = tf.keras.layers.Conv2D(C // 8, 1, padding='same', use_bias=False)
         self.v        = tf.keras.layers.Conv2D(C,       1, padding='same', use_bias=False)
         self.out_proj = tf.keras.layers.Conv2D(C,       1, padding='same', use_bias=False)
-        self.gamma    = self.add_weight('gamma', shape=(), initializer='zeros',
+        self.gamma    = self.add_weight(name='gamma', shape=(), initializer='zeros',
                                         trainable=True)
 
     def call(self, x):
@@ -753,3 +774,297 @@ axes[2].legend()
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, 'loss_curves.png'), bbox_inches='tight')
 plt.show()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 19. Evaluation Metrics  [Level-4  J K L M]
+#
+#  A single Inception-v3 backbone (lazily loaded on first call) serves FID,
+#  KID, and IS.  LPIPS reuses the VGG-16 extractor already built in section 10.
+#
+#  Design notes:
+#    • No scipy dependency — matrix square root uses eigendecomposition of the
+#      symmetrised product Σ_r^{½} Σ_g Σ_r^{½} which IS symmetric PSD.
+#    • FID requires N >> 2048 for accuracy; a warning is printed when N < 2048.
+#    • KID is unbiased for any N ≥ 2 — preferred for small test sets.
+#    • IS splits adapt to the number of available images.
+#    • Test horses and zebras are collected in separate passes so all images of
+#      each class are used (they are unpaired — lengths differ).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Inception-v3 backbone (lazy singleton) ────────────────────────────────────
+_inception_cache: dict = {}
+
+
+def _get_inception() -> dict:
+    """Build (once) and return Inception-v3 feature and probability models."""
+    if not _inception_cache:
+        print('[EVAL] Loading Inception-v3 (one-time download ~90 MB) …')
+        base = tf.keras.applications.InceptionV3(
+            include_top=True, weights='imagenet'
+        )
+        base.trainable = False
+        _inception_cache['feats'] = tf.keras.Model(
+            base.input, base.get_layer('avg_pool').output   # (2048,)
+        )
+        _inception_cache['probs'] = tf.keras.Model(
+            base.input, base.output                         # (1000,) softmax
+        )
+    return _inception_cache
+
+
+def _preprocess_inception(images: tf.Tensor) -> tf.Tensor:
+    """Resize to 299×299 and map [-1, 1] → Inception-v3 input range."""
+    images = tf.image.resize(images, [299, 299])
+    images = (images + 1.) * 127.5                        # [-1,1] → [0,255]
+    return tf.keras.applications.inception_v3.preprocess_input(images)
+
+
+def _inception_outputs(images_np: np.ndarray,
+                       batch_size: int = 32) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Run Inception-v3 on a numpy array of images in batches.
+
+    Returns:
+        feats  (N, 2048) — avg-pool features used for FID and KID
+        probs  (N, 1000) — softmax probabilities used for IS
+    """
+    inc = _get_inception()
+    feats_list, probs_list = [], []
+    for i in range(0, len(images_np), batch_size):
+        batch = _preprocess_inception(
+            tf.constant(images_np[i : i + batch_size], dtype=tf.float32)
+        )
+        feats_list.append(inc['feats'](batch, training=False).numpy())
+        probs_list.append(inc['probs'](batch, training=False).numpy())
+    return np.concatenate(feats_list), np.concatenate(probs_list)
+
+
+# ── J. FID — Fréchet Inception Distance ──────────────────────────────────────
+def _sym_matrix_sqrt(A: np.ndarray) -> np.ndarray:
+    """
+    Square root of a symmetric PSD matrix via eigendecomposition.
+    Used for the term Tr((Σ_r Σ_g)^{½}) in FID.
+
+    To avoid sqrtm of an asymmetric matrix we exploit:
+        Tr((Σ_r Σ_g)^{½}) = Tr((Σ_r^{½} Σ_g Σ_r^{½})^{½})
+    and call this function on the symmetric inner product Σ_r^{½} Σ_g Σ_r^{½}.
+    """
+    vals, vecs = np.linalg.eigh(A)
+    vals = np.maximum(vals, 0.)       # clamp tiny negatives from floating-point
+    return vecs @ np.diag(np.sqrt(vals)) @ vecs.T
+
+
+def compute_fid(real_feats: np.ndarray, fake_feats: np.ndarray) -> float:
+    """
+    Fréchet Inception Distance (Heusel et al., 2017).
+
+    FID = ‖μ_r − μ_g‖² + Tr(Σ_r + Σ_g − 2 (Σ_r Σ_g)^{½})
+
+    A small ridge (1e-6 I) is added to each covariance for numerical stability.
+    """
+    eps  = 1e-6 * np.eye(real_feats.shape[1])
+    mu_r = real_feats.mean(0);  sr = np.cov(real_feats, rowvar=False) + eps
+    mu_g = fake_feats.mean(0);  sg = np.cov(fake_feats, rowvar=False) + eps
+
+    # Build symmetric product: A = Σ_r^{½} Σ_g Σ_r^{½}
+    sqrt_sr = _sym_matrix_sqrt(sr)
+    A       = sqrt_sr @ sg @ sqrt_sr
+    sqrt_A  = _sym_matrix_sqrt(A)
+
+    diff = mu_r - mu_g
+    return float(diff @ diff + np.trace(sr + sg - 2. * sqrt_A))
+
+
+# ── K. KID — Kernel Inception Distance ───────────────────────────────────────
+def compute_kid(real_feats: np.ndarray, fake_feats: np.ndarray,
+                num_subsets: int = 100,
+                subset_size: int = 50) -> tuple[float, float]:
+    """
+    Kernel Inception Distance (Bińkowski et al., 2018).
+
+    Unbiased MMD² with polynomial kernel k(x,y) = (x·y/d + 1)³,
+    averaged over `num_subsets` random subsets of size `subset_size`.
+
+    Unlike FID, KID is unbiased and reliable even for N < 200.
+    Returns (mean_KID, std_KID).
+    """
+    n_r = real_feats.shape[0]
+    n_g = fake_feats.shape[0]
+    d   = real_feats.shape[1]
+    subset_size = min(subset_size, n_r, n_g)
+
+    kids = []
+    for _ in range(num_subsets):
+        r = real_feats[np.random.choice(n_r, subset_size, replace=False)]
+        g = fake_feats[np.random.choice(n_g, subset_size, replace=False)]
+
+        rr = (r @ r.T / d + 1.) ** 3          # (S, S)
+        rg = (r @ g.T / d + 1.) ** 3          # (S, S)
+        gg = (g @ g.T / d + 1.) ** 3          # (S, S)
+
+        # Unbiased MMD²: zero the diagonal (self-pairs) in rr and gg
+        n = subset_size
+        np.fill_diagonal(rr, 0.);  np.fill_diagonal(gg, 0.)
+        kid = rr.sum() / (n * (n - 1)) - 2. * rg.mean() + gg.sum() / (n * (n - 1))
+        kids.append(float(kid))
+
+    return float(np.mean(kids)), float(np.std(kids))
+
+
+# ── L. IS — Inception Score ───────────────────────────────────────────────────
+def compute_is(probs: np.ndarray,
+               splits: int = 10) -> tuple[float, float]:
+    """
+    Inception Score (Salimans et al., 2016).
+
+    IS = exp( E_x[ KL( p(y|x) ∥ p(y) ) ] )
+
+    p(y|x) = Inception softmax for one image.
+    p(y)   = marginal = mean of p(y|x) over the split.
+
+    High IS → images are both diverse (varied p(y)) and sharp (confident p(y|x)).
+    Returns (mean_IS, std_IS) across splits.
+    """
+    n       = probs.shape[0]
+    n_split = max(1, n // splits)
+    scores  = []
+    for i in range(splits):
+        p_yx = probs[i * n_split : (i + 1) * n_split]
+        if len(p_yx) == 0:
+            continue
+        p_y  = p_yx.mean(axis=0, keepdims=True)
+        kl   = p_yx * (np.log(p_yx + 1e-10) - np.log(p_y + 1e-10))
+        scores.append(float(np.exp(kl.sum(axis=1).mean())))
+    return float(np.mean(scores)), float(np.std(scores))
+
+
+# ── M. LPIPS proxy — VGG perceptual distance ──────────────────────────────────
+def compute_lpips(real_np: np.ndarray, cycled_np: np.ndarray,
+                  batch_size: int = 16) -> float:
+    """
+    VGG-based perceptual distance (proxy for LPIPS, Zhang et al. 2018).
+
+    Measures how faithfully F(G(x)) reconstructs x in VGG feature space
+    across three depths (block1, block2, block3).  Lower = better cycle fidelity.
+
+    Reuses _perceptual_extractor built in section 10 — no extra model needed.
+    """
+    prep = tf.keras.applications.vgg16.preprocess_input
+    dists = []
+    for i in range(0, len(real_np), batch_size):
+        r = tf.constant(real_np  [i : i + batch_size], dtype=tf.float32)
+        c = tf.constant(cycled_np[i : i + batch_size], dtype=tf.float32)
+        r_feats = _perceptual_extractor(prep((r + 1.) * 127.5), training=False)
+        c_feats = _perceptual_extractor(prep((c + 1.) * 127.5), training=False)
+        # Per-image mean L1 across spatial dims, averaged across VGG layers
+        dist = sum(
+            tf.reduce_mean(tf.abs(rf - cf), axis=[1, 2, 3])
+            for rf, cf in zip(r_feats, c_feats)
+        ) / 3.
+        dists.append(dist.numpy())
+    return float(np.concatenate(dists).mean())
+
+
+# ── Main evaluation entry point ───────────────────────────────────────────────
+def run_full_evaluation() -> dict:
+    """
+    Compute FID, KID, IS, LPIPS on the full test split and save to JSON.
+
+    Collection strategy (unpaired test set):
+      • Iterate test_horses once  → fake_zebras and cycled_horses
+      • Iterate test_zebras once  → real_zebras (for FID/KID reference)
+      Horses and zebras have different counts; they are collected independently.
+
+    Returns:
+        dict with all metric values (also written to output/metrics.json).
+    """
+    W = 52
+    print('\n' + '=' * W)
+    print('  EVALUATION  [Level-4: FID · KID · IS · LPIPS]')
+    print('=' * W)
+
+    # ── Pass 1: test horses → fake zebras + cycled horses ────────────────────
+    print('[EVAL] Generating fake zebras and cycled horses from test set …')
+    real_horses_buf, fake_zebras_buf, cycled_horses_buf = [], [], []
+    for horse_batch in test_horses:
+        fake_z  = generator_G(horse_batch, training=False)
+        cycled  = generator_F(fake_z,      training=False)
+        real_horses_buf.append(horse_batch.numpy())
+        fake_zebras_buf.append(fake_z.numpy())
+        cycled_horses_buf.append(cycled.numpy())
+
+    # ── Pass 2: test zebras → real zebras (reference for FID/KID) ────────────
+    real_zebras_buf = []
+    for zebra_batch in test_zebras:
+        real_zebras_buf.append(zebra_batch.numpy())
+
+    real_horses_np   = np.concatenate(real_horses_buf)
+    fake_zebras_np   = np.concatenate(fake_zebras_buf)
+    cycled_horses_np = np.concatenate(cycled_horses_buf)
+    real_zebras_np   = np.concatenate(real_zebras_buf)
+
+    n_gen  = len(fake_zebras_np)
+    n_real = len(real_zebras_np)
+    print(f'[EVAL] Generated zebras: {n_gen}  |  Real zebras: {n_real}')
+    if min(n_gen, n_real) < 2048:
+        print('[WARN] FID is most reliable with ≥ 2 048 images per split. '
+              'Values on this test set (~120 images) are indicative only. '
+              'KID is preferred for small N.')
+
+    # ── Inception features (FID, KID, IS all share one forward pass) ─────────
+    print('[EVAL] Extracting Inception-v3 features …')
+    real_z_feats, _             = _inception_outputs(real_zebras_np)
+    fake_z_feats, fake_z_probs  = _inception_outputs(fake_zebras_np)
+
+    # ── J. FID ────────────────────────────────────────────────────────────────
+    print('[EVAL] Computing FID …')
+    fid = compute_fid(real_z_feats, fake_z_feats)
+
+    # ── K. KID ────────────────────────────────────────────────────────────────
+    print('[EVAL] Computing KID (100 subsets) …')
+    kid_mean, kid_std = compute_kid(
+        real_z_feats, fake_z_feats,
+        num_subsets=100,
+        subset_size=min(50, n_gen, n_real),
+    )
+
+    # ── L. IS ─────────────────────────────────────────────────────────────────
+    print('[EVAL] Computing IS …')
+    n_splits = max(2, min(10, n_gen // 10))
+    is_mean, is_std = compute_is(fake_z_probs, splits=n_splits)
+
+    # ── M. LPIPS (VGG) ────────────────────────────────────────────────────────
+    print('[EVAL] Computing LPIPS (VGG) …')
+    lpips = compute_lpips(real_horses_np, cycled_horses_np)
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    results = {
+        'n_generated_zebras': n_gen,
+        'n_real_zebras':      n_real,
+        'FID':       round(fid,      3),
+        'KID_mean':  round(kid_mean, 6),
+        'KID_std':   round(kid_std,  6),
+        'IS_mean':   round(is_mean,  4),
+        'IS_std':    round(is_std,   4),
+        'LPIPS_VGG': round(lpips,    4),
+    }
+    path = os.path.join(OUTPUT_DIR, 'metrics.json')
+    with open(path, 'w') as fh:
+        json.dump(results, fh, indent=2)
+
+    # ── Pretty-print table ────────────────────────────────────────────────────
+    print('\n' + '─' * W)
+    print(f"  {'Metric':<18} {'Value':>14}  Direction")
+    print('─' * W)
+    print(f"  {'FID [J]':<18} {fid:>14.2f}  ↓ lower is better")
+    print(f"  {'KID [K]':<18} {kid_mean:>8.5f}±{kid_std:.5f}  ↓ lower is better")
+    print(f"  {'IS [L]':<18} {is_mean:>9.4f}±{is_std:.4f}  ↑ higher is better")
+    print(f"  {'LPIPS VGG [M]':<18} {lpips:>14.4f}  ↓ lower is better")
+    print('─' * W)
+    print(f'  Metrics saved → {path}')
+    print('=' * W + '\n')
+    return results
+
+
+# ── Run evaluation after training ─────────────────────────────────────────────
+metrics = run_full_evaluation()

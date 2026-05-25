@@ -1,0 +1,10 @@
+{
+  "training_steps": 100,
+  "training_time_sec": 1189.8,
+  "FID": 357.0,
+  "KID_mean": 0.346906,
+  "KID_std": 0.019102,
+  "IS_mean": 3.1656,
+  "IS_std": 0.4767,
+  "LPIPS_VGG": 123.3672
+}

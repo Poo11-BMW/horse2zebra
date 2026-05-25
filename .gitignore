@@ -1,0 +1,38 @@
+# Python virtual environment — never commit this (hundreds of MB)
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# TensorFlow / training artifacts
+*.h5
+*.pb
+*.ckpt
+*.ckpt.*
+checkpoint
+saved_model/
+
+# TensorFlow Datasets cache (auto-downloaded, no need to commit)
+# ~/tensorflow_datasets/ is outside repo anyway
+
+# Output images & metrics — optional: remove these lines if you WANT to commit results
+# output/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
