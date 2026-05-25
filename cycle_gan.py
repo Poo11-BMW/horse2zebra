@@ -1,18 +1,24 @@
 """
 CycleGAN — Horse ↔ Zebra
 ========================
-Fixes applied vs. the original notebook:
-  1. [Critical]  Removed sigmoid from discriminator output so raw logits match
-                 BinaryCrossentropy(from_logits=True).
-  2. [Arch]      Added InstanceNormalization to generator and discriminator for
-                 training stability.
-  3. [Arch]      Discriminator now uses LeakyReLU(0.2) instead of ReLU.
-  4. [Arch]      Bottleneck Conv blocks are proper residual blocks (skip connections).
-  5. [Quality]   Removed all unused imports (LSTM, VGG16, ResNet50, pandas, tqdm …).
-  6. [Quality]   Removed unused variables (image_input1, image_input2).
-  7. [Training]  Added checkpoint saving so training survives interruptions.
-  8. [Training]  Added per-epoch loss logging and a final loss-curve plot.
-  9. [Training]  generate_images() uses training=False and can optionally save to disk.
+Previous fixes (bug-fix pass):
+  1. Removed sigmoid / from_logits mismatch in discriminator + loss.
+  2. Added InstanceNormalization to generator and discriminator.
+  3. Discriminator uses LeakyReLU(0.2) instead of ReLU.
+  4. Bottleneck Conv blocks are proper residual blocks (skip connections).
+  5. Removed unused imports and variables.
+  6. Checkpoint saving, loss logging, generate_images uses training=False.
+
+Level-1 research upgrades (this pass):
+  A. [ImagePool]  50-image replay buffer fed to the discriminator — prevents
+                  the discriminator from overfitting to the latest batch and
+                  stabilises adversarial training (Shrivastava et al., 2017).
+  B. [LSGAN]      Replaced BinaryCrossentropy with MeanSquaredError (targets
+                  1.0 / 0.0). LSGAN provides smoother, non-saturating gradients
+                  and reduces mode collapse (Mao et al., 2017).
+  C. [LR Decay]   Learning rate is held constant for the first half of training
+                  then linearly decayed to zero — exactly as in the original
+                  CycleGAN paper (Zhu et al., 2017).
 """
 
 import os
@@ -204,7 +210,38 @@ def discriminator():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. Models & Optimizers  (Fix #6: unused image_input1/2 removed)
+# 6. Image Replay Buffer  [Level-1 upgrade A]
+#    Stores up to max_size past generated images.  On each call it returns
+#    the new image with probability 0.5 and a randomly swapped stored image
+#    otherwise — so the discriminator trains on a history of fakes, not just
+#    the ones produced in the current step.
+# ──────────────────────────────────────────────────────────────────────────────
+class ImagePool:
+    """50-image history buffer (Shrivastava et al., 2017)."""
+
+    def __init__(self, max_size: int = 50):
+        self.max_size = max_size
+        self.pool: list = []
+
+    def query(self, image: tf.Tensor) -> tf.Tensor:
+        """Accept one image (shape 1×H×W×3), return a possibly older one."""
+        if len(self.pool) < self.max_size:
+            self.pool.append(image)
+            return image
+        if np.random.rand() > 0.5:
+            idx = np.random.randint(len(self.pool))
+            stored = self.pool[idx]
+            self.pool[idx] = image   # swap in the new image
+            return stored
+        return image
+
+
+pool_fake_x = ImagePool()
+pool_fake_y = ImagePool()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Models & Optimizers
 # ──────────────────────────────────────────────────────────────────────────────
 generator_G     = generator()     # Horse → Zebra
 generator_F     = generator()     # Zebra → Horse
@@ -217,7 +254,7 @@ discriminator_X_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
 discriminator_Y_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. Checkpointing  (Fix #7)
+# 8. Checkpointing
 # ──────────────────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = './checkpoints'
 
@@ -242,20 +279,23 @@ else:
     print('[INFO] Starting training from scratch.')
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8. Loss Functions  (Fix #1: from_logits=True is now consistent with raw logits)
+# 9. Loss Functions  [Level-1 upgrade B — LSGAN]
+#    MSE(real_patch, 1.0) + MSE(fake_patch, 0.0) for discriminator.
+#    MSE(fake_patch, 1.0) for generator (fool discriminator).
+#    No from_logits needed — MSE operates directly on the raw logit values.
 # ──────────────────────────────────────────────────────────────────────────────
 LAMBDA   = 10
-loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+loss_obj = tf.keras.losses.MeanSquaredError()   # LSGAN (Mao et al., 2017)
 
 
 def discriminator_loss(real, generated):
-    real_loss = loss_obj(tf.ones_like(real),       real)
-    fake_loss = loss_obj(tf.zeros_like(generated), generated)
+    real_loss = loss_obj(tf.ones_like(real),       real)        # target = 1
+    fake_loss = loss_obj(tf.zeros_like(generated), generated)   # target = 0
     return (real_loss + fake_loss) * 0.5
 
 
 def generator_loss(generated):
-    return loss_obj(tf.ones_like(generated), generated)
+    return loss_obj(tf.ones_like(generated), generated)         # fool disc → 1
 
 
 def calc_cycle_loss(real_image, cycled_image):
@@ -267,12 +307,23 @@ def identity_loss(real_image, same_image):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. Training Step
+# 10. Training Steps  [Level-1 upgrade A — replay buffer between the two steps]
+#
+#  The replay buffer is a Python object whose .query() method has Python-level
+#  randomness, so it cannot live inside a @tf.function.  We therefore split the
+#  original single train_step into two traced functions:
+#
+#    generator_step()      → produces fake_x / fake_y, updates generators
+#    discriminator_step()  → receives buffered fakes, updates discriminators
+#
+#  The Python training loop calls pool.query() between the two, mixing in older
+#  generated images before the discriminator sees them.
 # ──────────────────────────────────────────────────────────────────────────────
+
 @tf.function
-def train_step(real_x, real_y):
+def generator_step(real_x, real_y):
+    """Update both generators; return fresh fakes + generator losses."""
     with tf.GradientTape(persistent=True) as tape:
-        # Forward passes
         fake_y   = generator_G(real_x, training=True)
         cycled_x = generator_F(fake_y, training=True)
 
@@ -282,12 +333,11 @@ def train_step(real_x, real_y):
         same_x   = generator_F(real_x, training=True)   # identity
         same_y   = generator_G(real_y, training=True)   # identity
 
-        disc_real_x = discriminator_X(real_x, training=True)
-        disc_real_y = discriminator_Y(real_y, training=True)
-        disc_fake_x = discriminator_X(fake_x, training=True)
-        disc_fake_y = discriminator_Y(fake_y, training=True)
+        # Discriminators run in inference mode here — we only need their
+        # signal to compute generator loss, not to update their weights.
+        disc_fake_x = discriminator_X(fake_x, training=False)
+        disc_fake_y = discriminator_Y(fake_y, training=False)
 
-        # Losses
         gen_g_loss = generator_loss(disc_fake_y)
         gen_f_loss = generator_loss(disc_fake_x)
 
@@ -297,10 +347,6 @@ def train_step(real_x, real_y):
         total_gen_g_loss = gen_g_loss + total_cycle + identity_loss(real_y, same_y)
         total_gen_f_loss = gen_f_loss + total_cycle + identity_loss(real_x, same_x)
 
-        disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
-        disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
-
-    # Apply gradients
     generator_G_optimizer.apply_gradients(
         zip(tape.gradient(total_gen_g_loss, generator_G.trainable_variables),
             generator_G.trainable_variables)
@@ -309,6 +355,22 @@ def train_step(real_x, real_y):
         zip(tape.gradient(total_gen_f_loss, generator_F.trainable_variables),
             generator_F.trainable_variables)
     )
+
+    return fake_x, fake_y, total_gen_g_loss, total_gen_f_loss
+
+
+@tf.function
+def discriminator_step(real_x, real_y, buffered_fake_x, buffered_fake_y):
+    """Update both discriminators using (possibly historical) fake images."""
+    with tf.GradientTape(persistent=True) as tape:
+        disc_real_x = discriminator_X(real_x,         training=True)
+        disc_real_y = discriminator_Y(real_y,         training=True)
+        disc_fake_x = discriminator_X(buffered_fake_x, training=True)
+        disc_fake_y = discriminator_Y(buffered_fake_y, training=True)
+
+        disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
+        disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
+
     discriminator_X_optimizer.apply_gradients(
         zip(tape.gradient(disc_x_loss, discriminator_X.trainable_variables),
             discriminator_X.trainable_variables)
@@ -318,11 +380,25 @@ def train_step(real_x, real_y):
             discriminator_Y.trainable_variables)
     )
 
-    return total_gen_g_loss, total_gen_f_loss, disc_x_loss, disc_y_loss
+    return disc_x_loss, disc_y_loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. Visualisation  (Fix #9: training=False, optional save-to-disk)
+# 11. Linear LR Decay Schedule  [Level-1 upgrade C]
+#     Returns the learning rate for a given epoch:
+#       epochs  0 …  N/2-1  →  initial_lr  (constant)
+#       epochs N/2 … N-1    →  linear decay to 0
+# ──────────────────────────────────────────────────────────────────────────────
+def get_lr(epoch: int, total_epochs: int, initial_lr: float = 2e-4) -> float:
+    decay_start = total_epochs // 2
+    if epoch < decay_start:
+        return initial_lr
+    progress = (epoch - decay_start) / max(1, total_epochs - decay_start)
+    return float(initial_lr * (1.0 - progress))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. Visualisation
 # ──────────────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = './output'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -345,29 +421,51 @@ def generate_images(model, test_input, epoch=None, save: bool = False):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. Training Loop  (Fix #8: loss logging)
+# 13. Training Loop
+#     Each step:
+#       1. generator_step()  → fresh fakes + generator losses
+#       2. pool.query()      → swap in historical fakes (replay buffer)
+#       3. discriminator_step() → discriminator losses on buffered fakes
+#     Each epoch start: apply linear LR decay to all four optimizers.
 # ──────────────────────────────────────────────────────────────────────────────
 EPOCHS = 5
 history = {'gen_g': [], 'gen_f': [], 'disc_x': [], 'disc_y': []}
 
 for epoch in range(EPOCHS):
     start = time.time()
+
+    # ── Linear LR Decay [Level-1 upgrade C] ──────────────────────────────────
+    lr = get_lr(epoch, EPOCHS)
+    for opt in [generator_G_optimizer, generator_F_optimizer,
+                discriminator_X_optimizer, discriminator_Y_optimizer]:
+        opt.learning_rate.assign(lr)
+    # ─────────────────────────────────────────────────────────────────────────
+
     step_losses = {'gen_g': [], 'gen_f': [], 'disc_x': [], 'disc_y': []}
 
     for image_x, image_y in tf.data.Dataset.zip((train_horses, train_zebras)):
-        g_g, g_f, d_x, d_y = train_step(image_x, image_y)
+        # Step 1 — update generators, collect fresh fake images
+        fake_x, fake_y, g_g, g_f = generator_step(image_x, image_y)
+
+        # Step 2 — replay buffer: maybe return an older fake instead  [upgrade A]
+        buffered_fake_x = pool_fake_x.query(fake_x)
+        buffered_fake_y = pool_fake_y.query(fake_y)
+
+        # Step 3 — update discriminators with (possibly historical) fakes
+        d_x, d_y = discriminator_step(image_x, image_y,
+                                      buffered_fake_x, buffered_fake_y)
+
         step_losses['gen_g'].append(float(g_g))
         step_losses['gen_f'].append(float(g_f))
         step_losses['disc_x'].append(float(d_x))
         step_losses['disc_y'].append(float(d_y))
 
-    # Average losses across all steps in the epoch
     for key in history:
         history[key].append(np.mean(step_losses[key]))
 
     elapsed = time.time() - start
     print(
-        f"Epoch {epoch + 1:>3}/{EPOCHS} | "
+        f"Epoch {epoch + 1:>3}/{EPOCHS} | lr={lr:.2e} | "
         f"Gen_G: {history['gen_g'][-1]:.4f} | "
         f"Gen_F: {history['gen_f'][-1]:.4f} | "
         f"Disc_X: {history['disc_x'][-1]:.4f} | "
@@ -379,7 +477,7 @@ for epoch in range(EPOCHS):
     ckpt_manager.save()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 12. Loss Curves  (Fix #8)
+# 14. Loss Curves
 # ──────────────────────────────────────────────────────────────────────────────
 plt.figure(figsize=(12, 4))
 
