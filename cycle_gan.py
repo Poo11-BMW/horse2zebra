@@ -9,7 +9,7 @@ Previous fixes (bug-fix pass):
   5. Removed unused imports and variables.
   6. Checkpoint saving, loss logging, generate_images uses training=False.
 
-Level-1 research upgrades (this pass):
+Level-1 research upgrades:
   A. [ImagePool]  50-image replay buffer fed to the discriminator — prevents
                   the discriminator from overfitting to the latest batch and
                   stabilises adversarial training (Shrivastava et al., 2017).
@@ -19,6 +19,22 @@ Level-1 research upgrades (this pass):
   C. [LR Decay]   Learning rate is held constant for the first half of training
                   then linearly decayed to zero — exactly as in the original
                   CycleGAN paper (Zhu et al., 2017).
+
+Level-2 research upgrades (this pass):
+  D. [SelfAttention]         Non-local self-attention (Zhang et al., SAGAN 2019)
+                             inserted after the generator bottleneck. Lets the
+                             network relate distant spatial positions — e.g. the
+                             stripe pattern on a horse's back and flank —
+                             without needing deeper stacks of convolutions.
+  E. [MultiScaleDiscriminator] Two PatchGAN discriminators operating at 256×256
+                             and 128×128. The coarse scale judges global shape;
+                             the fine scale judges local texture. Their losses
+                             are averaged (Wang et al., pix2pixHD 2018).
+  F. [SpectralNormalization] Every Conv layer in both discriminator scales is
+                             wrapped with SpectralNormalization. This hard-
+                             constrains the Lipschitz constant of each weight
+                             matrix, preventing the discriminator from
+                             dominating the generator (Miyato et al., 2018).
 """
 
 import os
@@ -129,7 +145,47 @@ class InstanceNormalization(tf.keras.layers.Layer):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4. Generator  (Fixes #2, #4)
+# 4. Self-Attention  [Level-2 upgrade D]
+#    Non-local block: every position attends to every other position via
+#    scaled dot-product attention over 1×1-projected Q, K, V maps.
+#    gamma is initialised to 0 so the block starts as an identity and learns
+#    to contribute gradually — safe to insert without destabilising early training.
+# ──────────────────────────────────────────────────────────────────────────────
+class SelfAttention(tf.keras.layers.Layer):
+    """Non-local self-attention (Zhang et al., SAGAN 2019)."""
+
+    def build(self, input_shape):
+        C = input_shape[-1]
+        # Q and K project to C/8 channels to keep the attention map cheap
+        self.q       = tf.keras.layers.Conv2D(C // 8, 1, padding='same', use_bias=False)
+        self.k       = tf.keras.layers.Conv2D(C // 8, 1, padding='same', use_bias=False)
+        self.v       = tf.keras.layers.Conv2D(C,       1, padding='same', use_bias=False)
+        self.out_proj = tf.keras.layers.Conv2D(C,      1, padding='same', use_bias=False)
+        # Learnable residual scale — starts at 0 (identity) and grows during training
+        self.gamma   = self.add_weight('gamma', shape=(), initializer='zeros',
+                                       trainable=True)
+
+    def call(self, x):
+        B  = tf.shape(x)[0]
+        H  = tf.shape(x)[1]
+        W  = tf.shape(x)[2]
+        C  = tf.shape(x)[3]
+        Ck = C // 8
+
+        q = tf.reshape(self.q(x), [B, H * W, Ck])   # (B, N, C/8)
+        k = tf.reshape(self.k(x), [B, H * W, Ck])   # (B, N, C/8)
+        v = tf.reshape(self.v(x), [B, H * W, C])    # (B, N, C)
+
+        # Scaled dot-product attention: softmax(Q Kᵀ / √d) V
+        scale = tf.cast(Ck, tf.float32) ** -0.5
+        attn  = tf.nn.softmax(tf.matmul(q, k, transpose_b=True) * scale)  # (B, N, N)
+
+        out = tf.reshape(tf.matmul(attn, v), [B, H, W, C])
+        return self.gamma * self.out_proj(out) + x   # residual
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. Generator  (Fixes #2, #4)
 #    • InstanceNormalization after every Conv layer
 #    • Bottleneck uses true residual blocks (skip connections)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -164,6 +220,9 @@ def generator():
     for _ in range(6):
         x = residual_block(x, 256)
 
+    # Non-local self-attention at the bottleneck (64×64×256)  [Level-2 upgrade D]
+    x = SelfAttention()(x)
+
     # Upsampling
     x = tf.keras.layers.Conv2DTranspose(128, 3, strides=2, padding='same')(x)
     x = InstanceNormalization()(x)
@@ -180,33 +239,72 @@ def generator():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. Discriminator  (Fixes #1, #2, #3)
-#    • No sigmoid → raw logits to match BinaryCrossentropy(from_logits=True)
-#    • InstanceNormalization on inner layers
-#    • LeakyReLU(0.2) throughout (standard PatchGAN)
+# 6. Discriminator  [Level-2 upgrades E + F]
+#
+#  _make_discriminator()      — single PatchGAN scale with SpectralNorm on
+#                               every Conv (Miyato et al., 2018).  Uses
+#                               (None, None, 3) inputs so the same architecture
+#                               works at any resolution.
+#
+#  MultiScaleDiscriminator    — wraps two _make_discriminator() instances.
+#                               Scale 0 sees the full 256×256 image; scale 1
+#                               sees the 128×128 average-pooled version.
+#                               Losses are averaged across scales.
 # ──────────────────────────────────────────────────────────────────────────────
-def discriminator():
-    inp = tf.keras.layers.Input(shape=(256, 256, 3))
+_SN = tf.keras.layers.SpectralNormalization   # shorthand
 
-    x = tf.keras.layers.Conv2D(64,  4, strides=2, padding='same')(inp)
-    x = tf.keras.layers.LeakyReLU(0.2)(x)                # no norm on first layer
 
-    x = tf.keras.layers.Conv2D(128, 4, strides=2, padding='same')(x)
+def _make_discriminator() -> tf.keras.Model:
+    """Single-scale PatchGAN with SpectralNorm + InstanceNorm + LeakyReLU."""
+    inp = tf.keras.layers.Input(shape=(None, None, 3))   # resolution-agnostic
+
+    x = _SN(tf.keras.layers.Conv2D(64,  4, strides=2, padding='same'))(inp)
+    x = tf.keras.layers.LeakyReLU(0.2)(x)               # no norm on first layer
+
+    x = _SN(tf.keras.layers.Conv2D(128, 4, strides=2, padding='same'))(x)
     x = InstanceNormalization()(x)
     x = tf.keras.layers.LeakyReLU(0.2)(x)
 
-    x = tf.keras.layers.Conv2D(256, 4, strides=2, padding='same')(x)
+    x = _SN(tf.keras.layers.Conv2D(256, 4, strides=2, padding='same'))(x)
     x = InstanceNormalization()(x)
     x = tf.keras.layers.LeakyReLU(0.2)(x)
 
-    x = tf.keras.layers.Conv2D(128, 4, strides=2, padding='same')(x)
+    x = _SN(tf.keras.layers.Conv2D(128, 4, strides=2, padding='same'))(x)
     x = InstanceNormalization()(x)
     x = tf.keras.layers.LeakyReLU(0.2)(x)
 
-    # Raw logit output — no sigmoid (Fix #1)
-    out = tf.keras.layers.Conv2D(1, 4, strides=1, padding='same')(x)
+    # Raw logit patch map — no sigmoid (consistent with LSGAN MSE loss)
+    out = _SN(tf.keras.layers.Conv2D(1, 4, strides=1, padding='same'))(x)
 
     return tf.keras.Model(inputs=inp, outputs=out)
+
+
+class MultiScaleDiscriminator(tf.keras.Model):
+    """Two PatchGAN discriminators at different spatial scales (pix2pixHD).
+
+    Scale 0 — 256×256 : catches fine-grained local texture (stripe sharpness)
+    Scale 1 — 128×128 : catches coarse global structure (body shape)
+
+    Losses are averaged so neither scale dominates.
+    All variables are trackable via .trainable_variables for checkpointing.
+    """
+    NUM_SCALES = 2
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.disc_scales = [_make_discriminator() for _ in range(self.NUM_SCALES)]
+        self.downsample  = tf.keras.layers.AveragePooling2D(
+            pool_size=2, strides=2, padding='same'
+        )
+
+    def call(self, x, training: bool = False) -> list:
+        """Return one patch-map tensor per scale."""
+        outputs = []
+        for i, disc in enumerate(self.disc_scales):
+            if i > 0:
+                x = self.downsample(x)
+            outputs.append(disc(x, training=training))
+        return outputs
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -241,12 +339,12 @@ pool_fake_y = ImagePool()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7. Models & Optimizers
+# 8. Models & Optimizers
 # ──────────────────────────────────────────────────────────────────────────────
-generator_G     = generator()     # Horse → Zebra
-generator_F     = generator()     # Zebra → Horse
-discriminator_X = discriminator() # judges Horses
-discriminator_Y = discriminator() # judges Zebras
+generator_G     = generator()                 # Horse → Zebra
+generator_F     = generator()                 # Zebra → Horse
+discriminator_X = MultiScaleDiscriminator()   # judges Horses (2 scales)
+discriminator_Y = MultiScaleDiscriminator()   # judges Zebras  (2 scales)
 
 generator_G_optimizer     = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
 generator_F_optimizer     = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
@@ -279,23 +377,34 @@ else:
     print('[INFO] Starting training from scratch.')
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9. Loss Functions  [Level-1 upgrade B — LSGAN]
-#    MSE(real_patch, 1.0) + MSE(fake_patch, 0.0) for discriminator.
-#    MSE(fake_patch, 1.0) for generator (fool discriminator).
-#    No from_logits needed — MSE operates directly on the raw logit values.
+# 10. Loss Functions  [Level-1: LSGAN  |  Level-2: multi-scale outputs]
+#
+#  discriminator_loss / generator_loss now accept a Python list of patch-map
+#  tensors (one per scale) and average the LSGAN MSE loss across all scales.
+#  Single-tensor inputs still work — they are wrapped in a list automatically.
 # ──────────────────────────────────────────────────────────────────────────────
 LAMBDA   = 10
 loss_obj = tf.keras.losses.MeanSquaredError()   # LSGAN (Mao et al., 2017)
 
 
+def _to_list(x):
+    return x if isinstance(x, list) else [x]
+
+
 def discriminator_loss(real, generated):
-    real_loss = loss_obj(tf.ones_like(real),       real)        # target = 1
-    fake_loss = loss_obj(tf.zeros_like(generated), generated)   # target = 0
-    return (real_loss + fake_loss) * 0.5
+    """Average LSGAN loss across all discriminator scales."""
+    total = 0.0
+    pairs = list(zip(_to_list(real), _to_list(generated)))
+    for r, g in pairs:
+        total += (loss_obj(tf.ones_like(r),  r) +
+                  loss_obj(tf.zeros_like(g), g)) * 0.5
+    return total / len(pairs)
 
 
 def generator_loss(generated):
-    return loss_obj(tf.ones_like(generated), generated)         # fool disc → 1
+    """Average generator loss across all discriminator scales (fool disc → 1)."""
+    outs = _to_list(generated)
+    return sum(loss_obj(tf.ones_like(g), g) for g in outs) / len(outs)
 
 
 def calc_cycle_loss(real_image, cycled_image):
@@ -307,17 +416,19 @@ def identity_loss(real_image, same_image):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. Training Steps  [Level-1 upgrade A — replay buffer between the two steps]
+# 11. Training Steps
 #
-#  The replay buffer is a Python object whose .query() method has Python-level
-#  randomness, so it cannot live inside a @tf.function.  We therefore split the
-#  original single train_step into two traced functions:
+#  Two @tf.function-traced steps with Python-land replay buffer between them:
 #
-#    generator_step()      → produces fake_x / fake_y, updates generators
-#    discriminator_step()  → receives buffered fakes, updates discriminators
+#    generator_step()      → produces fake_x / fake_y, updates both generators.
+#                            Calls discriminators in inference mode (training=False)
+#                            to get the adversarial signal — does NOT update them.
+#    pool.query()          → Python-land: maybe swap in a historical fake image.
+#    discriminator_step()  → updates both MultiScaleDiscriminators using the
+#                            (possibly historical) buffered fakes.
 #
-#  The Python training loop calls pool.query() between the two, mixing in older
-#  generated images before the discriminator sees them.
+#  discriminator_X / discriminator_Y are MultiScaleDiscriminator instances that
+#  return a list of patch-maps.  generator_loss / discriminator_loss handle lists.
 # ──────────────────────────────────────────────────────────────────────────────
 
 @tf.function
