@@ -1,0 +1,21 @@
+# ─────────────────────────────────────────────────────────────────
+# CycleGAN Horse ↔ Zebra — dependencies
+#
+# Python 3.10 / 3.11 / 3.12  (TensorFlow does NOT support Python 3.13+)
+#
+# Local install (standard):
+#   python3.11 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Apple Silicon (M1/M2/M3) — use these instead of plain tensorflow:
+#   pip install tensorflow-macos tensorflow-metal tensorflow-datasets \
+#               matplotlib numpy
+#
+# Google Colab — tensorflow is pre-installed; run only:
+#   pip install tensorflow-datasets
+# ─────────────────────────────────────────────────────────────────
+
+tensorflow>=2.16.0,<2.19.0
+tensorflow-datasets>=4.9.0
+matplotlib>=3.7.0
+numpy>=1.26.0
